@@ -132,17 +132,53 @@ class DiversityLoss(nn.Module):
 
     def forward(self, pred, target):
         mse_loss = self.mse(pred, target)
-        # Scale predictions by temperature to control spreading force
-        scaled_pred = pred / self.temperature
-        diff_matrix = scaled_pred.unsqueeze(0) - scaled_pred.unsqueeze(1)
-        too_similar = torch.abs(diff_matrix) < self.similarity_threshold
-        too_similar.fill_diagonal_(False)
-        similarity_counts = too_similar.float().sum(dim=1)
-        diversity_penalty = torch.exp(similarity_counts / pred.shape[0]) - 1
+
+        # Identify predictions that are within 0.2 of target (in normalized [-1,1] range)
+        close_to_target = torch.abs(pred - target) < 0.2
+
+        # Initialize diversity loss with zeros for all predictions
+        batch_size = pred.shape[0]
+        diversity_penalty = torch.zeros(batch_size, device=pred.device)
+
+        if not close_to_target.all():  # Only apply diversity loss if we have any predictions not close to target
+            # Only apply diversity to predictions not close to their target
+            pred_for_diversity = pred[~close_to_target]
+            scaled_pred = pred_for_diversity / self.temperature
+            diff_matrix = scaled_pred.unsqueeze(0) - scaled_pred.unsqueeze(1)
+            too_similar = torch.abs(diff_matrix) < self.similarity_threshold
+            too_similar.fill_diagonal_(False)
+            similarity_counts = too_similar.float().sum(dim=1)
+
+            # Calculate diversity penalty only for predictions not close to target
+            not_close_penalty = torch.exp(similarity_counts / batch_size) - 1
+
+            # Place these penalties back into the full-sized tensor (keeping zeros for close predictions)
+            diversity_penalty[~close_to_target] = not_close_penalty
+
+            # Weight based on overall similarity across non-close predictions
+            if len(pred_for_diversity) > 0:
+                current_weight = self.diversity_weight * (1 - torch.exp(-similarity_counts.mean()))
+            else:
+                current_weight = 0.0
+        else:
+            current_weight = 0.0
+
+        # Calculate mean diversity penalty across ALL predictions (including zeros for close ones)
         diversity_loss = diversity_penalty.mean()
-        # Could also use curriculum on the diversity weight
-        current_weight = self.diversity_weight * (1 - torch.exp(-similarity_counts.mean()))
         total_loss = mse_loss + current_weight * diversity_loss
+
+        # Debug prints
+        if torch.rand(1).item() < 0.01:  # Print for ~1% of batches to avoid spam
+            print(f"\nLoss Components:")
+            print(f"MSE Loss: {mse_loss:.6f}")
+            print(f"Diversity Loss: {diversity_loss:.6f}")
+            print(f"Current Diversity Weight: {current_weight:.6f}")
+            print(f"Predictions close to target: {close_to_target.sum().item()}/{batch_size}")
+            if not close_to_target.all() and len(pred_for_diversity) > 0:
+                print(f"Similar pairs ratio for far preds: {similarity_counts.float().mean()/len(pred_for_diversity):.3f}")
+            print(f"Predictions mean: {pred.mean():.3f}, std: {pred.std():.3f}")
+            print(f"Unique prediction values: {len(torch.unique(pred))}")
+
         return total_loss
 
 class CurriculumDataset(Dataset):
