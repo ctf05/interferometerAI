@@ -67,14 +67,17 @@ class SinusoidalPositionalEncoding(nn.Module):
         return torch.cat([x, pos_encoding], dim=1)
 
 class FourierConvLayer(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.stride = stride
 
         # Real and imaginary convolutions in frequency domain
-        self.conv_real = nn.Conv2d(in_channels, out_channels, 1)
-        self.conv_imag = nn.Conv2d(in_channels, out_channels, 1)
+        self.conv_real = nn.Conv2d(in_channels, out_channels, kernel_size=3,
+                                   stride=stride, padding=1, bias=False)
+        self.conv_imag = nn.Conv2d(in_channels, out_channels, kernel_size=3,
+                                   stride=stride, padding=1, bias=False)
         self.bn = nn.BatchNorm2d(out_channels)
 
     def forward(self, x):
@@ -84,13 +87,16 @@ class FourierConvLayer(nn.Module):
         # Get real and imaginary components
         real, imag = x_fft.real, x_fft.imag
 
-        # Apply convolutions in frequency domain
+        # Apply convolutions in frequency domain with stride
         real_out = self.conv_real(real) - self.conv_imag(imag)
         imag_out = self.conv_real(imag) + self.conv_imag(real)
 
         # Recombine and apply inverse FFT
         x_fft_out = torch.complex(real_out, imag_out)
-        x_out = torch.fft.irfft2(x_fft_out, s=(x.shape[2], x.shape[3]))
+
+        # Compute output size based on stride
+        output_size = (x.shape[2] // self.stride, x.shape[3] // self.stride)
+        x_out = torch.fft.irfft2(x_fft_out, s=output_size)
 
         return self.bn(x_out)
 
@@ -117,7 +123,7 @@ class ResidualBlock(nn.Module):
         # Optional Fourier branch
         self.use_fourier = use_fourier
         if use_fourier:
-            self.fourier = FourierConvLayer(in_channels, out_channels)
+            self.fourier = FourierConvLayer(in_channels, out_channels, stride=stride)
             self.fourier_weight = nn.Parameter(torch.tensor(0.2))
 
     def forward(self, x):
