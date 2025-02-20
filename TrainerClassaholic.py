@@ -99,6 +99,7 @@ class InterferogramNet(nn.Module):
             print(f"\nForward pass {self.forward_count}")
             print(f"Input shape: {x.shape}")
             print(f"Input range: [{x.min():.3f}, {x.max():.3f}]")
+            print(f"VRAM usage: {torch.cuda.memory_allocated() / 1024**2:.1f}MB / {torch.cuda.memory_reserved() / 1024**2:.1f}MB")
 
         x = self.initial(x)
         x = self.layer1(x)
@@ -108,6 +109,7 @@ class InterferogramNet(nn.Module):
         if self.forward_count < 5:
             print(f"After features shape: {x.shape}")
             print(f"After features range: [{x.min():.3f}, {x.max():.3f}]")
+            print(f"VRAM usage: {torch.cuda.memory_allocated() / 1024**2:.1f}MB / {torch.cuda.memory_reserved() / 1024**2:.1f}MB")
 
         x = x.view(x.size(0), -1)
         x = self.classifier(x)
@@ -115,6 +117,7 @@ class InterferogramNet(nn.Module):
         if self.forward_count < 5:
             print(f"Output shape: {x.shape}")
             print(f"Output range: [{x.min():.3f}, {x.max():.3f}]")
+            print(f"VRAM usage: {torch.cuda.memory_allocated() / 1024**2:.1f}MB / {torch.cuda.memory_reserved() / 1024**2:.1f}MB")
 
         self.forward_count += 1
         return x
@@ -220,7 +223,7 @@ class CurriculumDataset(Dataset):
     def __getitem__(self, idx):
         return self.images[idx], self.all_params[idx]
 
-def create_curriculum_loader(folder_path, active_coeffs, batch_size=40, num_workers=12):
+def create_curriculum_loader(folder_path, active_coeffs, batch_size=140, num_workers=64):
     """Create a dataloader for a specific curriculum phase."""
     dataset = CurriculumDataset(folder_path, active_coeffs)
 
