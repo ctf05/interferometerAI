@@ -35,7 +35,7 @@ def Interferogram_Plot(D, C, B, G, F, J, E, I, pixels, _):
     return grey_plot
 
 class DataGenerator:
-    def __init__(self, resolution=224, images_per_folder=5000):
+    def __init__(self, resolution=224, images_per_folder=2000):
         self.res = resolution
         self.images_per_folder = images_per_folder
         self.param_names = ['D', 'C', 'B', 'G', 'F', 'J', 'E', 'I']
@@ -96,7 +96,7 @@ class DataGenerator:
             image.save(write_file)
 
 def main():
-    generator = DataGenerator(resolution=224, images_per_folder=5000)
+    generator = DataGenerator(resolution=224, images_per_folder=2000)
     generator.create_folder_structure()
 
 if __name__ == '__main__':

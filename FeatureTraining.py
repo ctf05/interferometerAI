@@ -46,10 +46,12 @@ def process_images(image_dir):
     image_paths = glob.glob(os.path.join(image_dir, "*.jpg"))
     phase_maps = []
 
-    for image_path in image_paths:
-        image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-        phase_map = extract_phase_gradient(image)
-        phase_maps.append(phase_map)
+    for i, image_path in enumerate(image_paths):
+        if i % 50 == 0:
+            print(f"Processing image {i}/{len(image_paths)}")
+            image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+            phase_map = extract_phase_gradient(image)
+            phase_maps.append(phase_map)
 
     return np.array(phase_maps)
 
@@ -88,3 +90,12 @@ if __name__ == "__main__":
     labels = np.random.rand(len(phase_data))
 
     trained_model, trained_scaler = train_model(phase_data.reshape(len(phase_data), -1), labels, model_type="svr")
+
+    # Example predictions
+    example_data = phase_data[:5].reshape(50, -1)  # Take the first 5 samples for prediction
+    example_data_scaled = trained_scaler.transform(example_data)
+    predictions = trained_model.predict(example_data_scaled)
+
+    print("\nExample Predictions and Actual Labels:")
+    for i, (prediction, actual) in enumerate(zip(predictions, labels[:50])):
+        print(f"Sample {i+1}: Prediction: {prediction:.4f}, Actual: {actual:.4f}")

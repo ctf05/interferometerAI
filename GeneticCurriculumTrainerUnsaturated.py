@@ -1,5 +1,6 @@
 import os
 import time
+import matplotlib
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,6 +11,7 @@ import numpy as np
 import glob
 from torch.nn.utils import clip_grad_norm_
 import matplotlib.pyplot as plt
+matplotlib.use('Agg')
 from datetime import datetime
 import math
 import copy
@@ -143,164 +145,31 @@ class ResidualBlock(nn.Module):
 
 class InterferogramNet(nn.Module):
     def __init__(self):
-        super(InterferogramNet, self).__init__()
-
-        # 1. Initial convolution with coordinate-aware features
+        super().__init__()
         self.initial = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.Conv2d(1, 32, 3, padding=1),
             nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-        self.positional_encoding = SinusoidalPositionalEncoding(32)
-
-        # Combine and adjust channels after positional encoding
-        # Input becomes 32 + 16 = 48 channels
-        self.post_positional = nn.Sequential(
-            nn.Conv2d(50, 32, kernel_size=1),
-            nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.2, inplace=True)
+            nn.LeakyReLU(0.2)
         )
 
-        # 2. Residual blocks with Fourier processing
-        # First layer doesn't use Fourier to save computation
-        self.layer1 = nn.Sequential(
-            ResidualBlock(32, 64, stride=2, use_fourier=False),
-            ResidualBlock(64, 64, use_fourier=True)
-        )
-        # Middle and later layers use Fourier processing
-        self.layer2 = nn.Sequential(
-            ResidualBlock(64, 128, stride=2, use_fourier=True),
-            ResidualBlock(128, 128, use_fourier=True)
-        )
-        self.layer3 = nn.Sequential(
-            ResidualBlock(128, 256, stride=2, use_fourier=True),
-            ResidualBlock(256, 256, use_fourier=True)
+        self.layers = nn.Sequential(
+            ResidualBlock(32, 64, stride=2),
+            ResidualBlock(64, 64),
+            ResidualBlock(64, 128, stride=2),
+            ResidualBlock(128, 128),
+            nn.AdaptiveAvgPool2d(1)
         )
 
-        # Global pooling (both max and average for better feature representation)
-        self.global_pool_avg = nn.AdaptiveAvgPool2d(1)
-        self.global_pool_max = nn.AdaptiveMaxPool2d(1)
-
-        # 3. Separate predictors for different coefficient types
-        # Low-order coefficients (Defocus: D)
-        self.defocus_predictor = nn.Sequential(
-            nn.Linear(512, 128),  # 512 = 256*2 (from avg+max pooling)
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.3),
+        self.fc = nn.Sequential(
             nn.Linear(128, 64),
             nn.LeakyReLU(0.2),
-            nn.Linear(64, 1)  # Predict D coefficient
+            nn.Linear(64, 8)
         )
-
-        # Tilt coefficients (B, C)
-        self.tilt_predictor = nn.Sequential(
-            nn.Linear(512, 128),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.2),
-            nn.Linear(128, 64),
-            nn.LeakyReLU(0.2),
-            nn.Linear(64, 2)  # Predict B, C coefficients
-        )
-
-        # Astigmatism coefficients (E, I)
-        self.astigmatism_predictor = nn.Sequential(
-            nn.Linear(512, 128),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.2),
-            nn.Linear(128, 64),
-            nn.LeakyReLU(0.2),
-            nn.Linear(64, 2)  # Predict E, I coefficients
-        )
-
-        # Higher-order coefficients (G, F, J)
-        self.higher_order_predictor = nn.Sequential(
-            nn.Linear(512, 128),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.3),
-            nn.Linear(128, 64),
-            nn.LeakyReLU(0.2),
-            nn.Linear(64, 3)  # Predict G, F, J coefficients
-        )
-
-        self.apply(self._init_weights)
-        self.forward_count = 0
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.xavier_uniform_(m.weight, gain=1.4)
-            if m.bias is not None:
-                # Use non-zero bias initialization to help break symmetry
-                nn.init.uniform_(m.bias, -0.1, 0.1)
-
-        elif isinstance(m, nn.Conv2d):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu', a=0.2)
-
-        elif isinstance(m, nn.BatchNorm2d):
-            nn.init.constant_(m.weight, 1)
-            nn.init.constant_(m.bias, 0)
-
-        # Special initialization for the final layer of each predictor
-        # This helps prevent the "all zeros" prediction problem
-        if isinstance(m, nn.Linear) and hasattr(m, 'out_features'):
-            if m.out_features <= 3:  # Final layer of any predictor
-                nn.init.normal_(m.weight, 0, 0.02)
-                if m.bias is not None:
-                    nn.init.uniform_(m.bias, -0.2, 0.2)
 
     def forward(self, x):
-        if self.forward_count < 5:
-            print(f"\nForward pass {self.forward_count}")
-            print(f"Input shape: {x.shape}")
-            print(f"Input range: [{x.min():.3f}, {x.max():.3f}]")
-            if torch.cuda.is_available():
-                print(f"VRAM usage: {torch.cuda.memory_allocated() / 1024**2:.1f}MB / {torch.cuda.memory_reserved() / 1024**2:.1f}MB")
-
-        # Initial processing with positional encoding
         x = self.initial(x)
-        x = self.positional_encoding(x)  # Adds coordinate-aware features
-        x = self.post_positional(x)
-
-        # Feature extraction through residual blocks with Fourier processing
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-
-        if self.forward_count < 5:
-            print(f"After features shape: {x.shape}")
-            print(f"After features range: [{x.min():.3f}, {x.max():.3f}]")
-            if torch.cuda.is_available():
-                print(f"VRAM usage: {torch.cuda.memory_allocated() / 1024**2:.1f}MB / {torch.cuda.memory_reserved() / 1024**2:.1f}MB")
-
-        # Global pooling (both average and max for better features)
-        x_avg = self.global_pool_avg(x).view(x.size(0), -1)
-        x_max = self.global_pool_max(x).view(x.size(0), -1)
-        x_pooled = torch.cat([x_avg, x_max], dim=1)
-
-        # Separate predictions through specialized pathways
-        defocus_out = self.defocus_predictor(x_pooled)            # D (index 0)
-        tilt_out = self.tilt_predictor(x_pooled)                  # B, C (indices 2, 1)
-        astigmatism_out = self.astigmatism_predictor(x_pooled)    # E, I (indices 6, 7)
-        higher_out = self.higher_order_predictor(x_pooled)        # G, F, J (indices 3, 4, 5)
-
-        # Reorder outputs to match expected [D, C, B, G, F, J, E, I] format
-        outputs = torch.cat([
-            defocus_out,                  # D (0)
-            tilt_out[:, 1:2],             # C (1)
-            tilt_out[:, 0:1],             # B (2)
-            higher_out[:, 0:1],           # G (3)
-            higher_out[:, 1:2],           # F (4)
-            higher_out[:, 2:3],           # J (5)
-            astigmatism_out[:, 0:1],      # E (6)
-            astigmatism_out[:, 1:2],      # I (7)
-        ], dim=1)
-
-        if self.forward_count < 5:
-            print(f"Output shape: {outputs.shape}")
-            print(f"Output range: [{outputs.min():.3f}, {outputs.max():.3f}]")
-            print(f"VRAM usage: {torch.cuda.memory_allocated() / 1024**2:.1f}MB / {torch.cuda.memory_reserved() / 1024**2:.1f}MB")
-
-        self.forward_count += 1
-        return outputs
+        x = self.layers(x)
+        return self.fc(x.squeeze())
 
 class PhaseAwareLoss(nn.Module):
     def __init__(self, similarity_threshold=0.1, diversity_weight=0.1, temperature=1.0, spread_factor=0.3, warm_up_epochs=5):
@@ -328,7 +197,7 @@ class PhaseAwareLoss(nn.Module):
 
         # Penalize predictions outside [-1, 1] range
         outside_range = torch.clamp(torch.abs(pred) - 1.0, min=0)
-        out_of_bounds_penalty = outside_range**2 * 10  # Quadratic penalty with higher weight
+        out_of_bounds_penalty = (outside_range + 1)**2 * 10 + .6
 
         # Combine all components
         total_loss = abs_error + correction_term + out_of_bounds_penalty
@@ -421,7 +290,7 @@ class PhaseAwareLoss(nn.Module):
                         current_weight = self.diversity_weight * (1 - torch.exp(-similarity_counts.mean()))
 
         # Calculate mean diversity penalty
-        diversity_loss = diversity_penalty.mean() ** 3
+        diversity_loss = (diversity_penalty.mean() * 100) ** 3
 
         # Apply epoch-dependent weighting to gradually increase spread importance
         epoch_factor = min(1.0, self.epoch / 20)
@@ -579,7 +448,7 @@ def create_curriculum_loader(folder_path, active_coeffs, batch_size=140, num_wor
 
     return train_loader, val_loader
 
-def get_cyclic_lr(epoch, batch_idx, batches_per_epoch, base_lr=1e-4, max_lr=1e-3):
+def get_cyclic_lr(epoch, batch_idx, batches_per_epoch, base_lr=5e-5, max_lr=1e-4):
     cycle_length = 10  # epochs
     cycle = (epoch + batch_idx/batches_per_epoch) / cycle_length
     cycle_position = cycle - int(cycle)
@@ -741,8 +610,8 @@ def train_curriculum():
     os.makedirs(log_dir, exist_ok=True)
 
     # Training settings
-    target_loss = 0.015  # Adjusted target loss to be more realistic
-    patience_limit = 100  # How many epochs to wait for improvement
+    target_loss = 0.05  # Adjusted target loss to be more realistic
+    patience_limit = 2  # How many epochs to wait for improvement
     max_epochs_per_phase = 1000
     param_names = ['D', 'C', 'B', 'G', 'F', 'J', 'E', 'I']
 
@@ -754,14 +623,14 @@ def train_curriculum():
     model = InterferogramNet().to(device)
     criterion = PhaseAwareLoss(
         similarity_threshold=0.25,
-        diversity_weight=1,
+        diversity_weight=.001,
         temperature=0.8,
         spread_factor=1
     )
 
     # Add warm-up phase to help break symmetry
     print("\n=== Starting warm-up phase ===")
-    warm_up_epochs = 1
+    warm_up_epochs = 0
 
     # Get data loader for warm-up (use everything folder but just one coefficient)
     train_loader, val_loader = create_curriculum_loader('TrainingD0_0', [0])
