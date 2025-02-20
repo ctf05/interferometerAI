@@ -365,7 +365,7 @@ class PhaseAwareLoss(nn.Module):
 
         # Calculate standard deviation to measure spread
         pred_std = pred.std(dim=0).mean()
-        spread_loss = torch.exp(-pred_std / self.spread_factor)
+        spread_loss = torch.exp(-pred_std / self.spread_factor) ** 2
 
         # Initialize diversity loss with zeros for all predictions
         diversity_penalty = torch.zeros(batch_size, device=pred.device)
@@ -421,7 +421,7 @@ class PhaseAwareLoss(nn.Module):
                         current_weight = self.diversity_weight * (1 - torch.exp(-similarity_counts.mean()))
 
         # Calculate mean diversity penalty
-        diversity_loss = diversity_penalty.mean()
+        diversity_loss = diversity_penalty.mean() ** 3
 
         # Apply epoch-dependent weighting to gradually increase spread importance
         epoch_factor = min(1.0, self.epoch / 20)
@@ -754,9 +754,9 @@ def train_curriculum():
     model = InterferogramNet().to(device)
     criterion = PhaseAwareLoss(
         similarity_threshold=0.25,
-        diversity_weight=1.0,
+        diversity_weight=1,
         temperature=0.8,
-        spread_factor=0.3
+        spread_factor=1
     )
 
     # Add warm-up phase to help break symmetry
