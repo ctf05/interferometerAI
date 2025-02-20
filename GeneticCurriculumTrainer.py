@@ -323,34 +323,36 @@ class PhaseAwareLoss(nn.Module):
         # Calculate absolute difference
         diff = torch.abs(pred - target)
 
-        # Apply edge scaling to predictions near boundaries
-        edge_scaling = torch.ones_like(pred)
+        # Clamp difference at 0.2 (maintain original saturation)
+        saturated_diff = torch.clamp(diff, max=0.2)
 
-        # Create scaling factors for edge regions [-1, -0.8] and [0.8, 1]
-        left_edge_mask = (pred < -0.8) & (pred >= -1.0)
-        right_edge_mask = (pred > 0.8) & (pred <= 1.0)
+        # Apply edge correction only near boundaries where statistical effects matter
+        edge_correction = torch.zeros_like(pred)
 
-        # Calculate how close we are to the edge (0 at -0.8/0.8, 1 at -1.0/1.0)
-        left_edge_factor = (-pred[left_edge_mask] - 0.8) / 0.2  # ranges from 0 to 1
-        right_edge_factor = (pred[right_edge_mask] - 0.8) / 0.2  # ranges from 0 to 1
+        # Only apply corrections in the edge regions (within 0.2 of boundary)
+        edge_zone = 0.2  # Size of edge zone where correction is needed
 
-        # Scale by reducing error proportionally to edge proximity
-        # As we approach edge, we scale down the error to compensate for "missing space"
-        edge_scaling[left_edge_mask] = 1.0 - 0.5 * left_edge_factor
-        edge_scaling[right_edge_mask] = 1.0 - 0.5 * right_edge_factor
+        # Calculate how far prediction is into the edge zone (0 at ±0.8, 1 at ±1.0)
+        left_edge_region = (pred <= -0.8) & (pred >= -1.0)
+        right_edge_region = (pred >= 0.8) & (pred <= 1.0)
 
-        # Apply scaling to make edge predictions statistically fair
-        scaled_diff = diff * edge_scaling
+        # Calculate position in edge zone (0 to 1 scale)
+        left_position = (-pred[left_edge_region] - 0.8) / 0.2  # 0 at -0.8, 1 at -1.0
+        right_position = (pred[right_edge_region] - 0.8) / 0.2  # 0 at 0.8, 1 at 1.0
 
-        # Clamp at 0.2 - any error larger than 0.2 gets same penalty
-        saturated_diff = torch.clamp(scaled_diff, max=0.2)
+        # Apply increasing correction as we approach the edge
+        # Maximum correction of 0.017 at the exact edge
+        edge_correction[left_edge_region] = left_position * 0.017
+        edge_correction[right_edge_region] = right_position * 0.017
 
         # Add out-of-range penalty (keep as is)
         out_of_range = torch.clamp(torch.abs(pred) - 1.0, min=0)
         range_penalty = out_of_range ** 2
 
-        # Combine the losses (always non-negative)
-        return saturated_diff + range_penalty
+        # Combine all components
+        balanced_loss = saturated_diff + edge_correction + range_penalty
+
+        return balanced_loss
 
     def forward(self, pred, target, is_training=False):
         # Ensure inputs are at least 2D (batch_size, num_coeffs)
@@ -758,8 +760,8 @@ def train_curriculum():
 
     # Training settings
     target_loss = 0.015  # Adjusted target loss to be more realistic
-    patience_limit = 50  # How many epochs to wait for improvement
-    max_epochs_per_phase = 100
+    patience_limit = 100  # How many epochs to wait for improvement
+    max_epochs_per_phase = 1000
     param_names = ['D', 'C', 'B', 'G', 'F', 'J', 'E', 'I']
 
     # Genetic exploration settings
