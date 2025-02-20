@@ -131,33 +131,18 @@ class DiversityLoss(nn.Module):
         self.temperature = temperature
 
     def forward(self, pred, target):
-        # Ensure pred and target are 2D tensors [batch_size, num_features]
-        if pred.dim() == 1:
-            pred = pred.unsqueeze(1)
-        if target.dim() == 1:
-            target = target.unsqueeze(1)
-
         mse_loss = self.mse(pred, target)
-
         # Scale predictions by temperature to control spreading force
-        scaled_pred = pred.view(pred.size(0), -1) / self.temperature  # Flatten to [batch_size, num_features]
-
-        # Compute pairwise differences
-        diff_matrix = scaled_pred.unsqueeze(1) - scaled_pred.unsqueeze(0)  # [batch_size, batch_size, num_features]
-
-        # Compute similarity based on L2 norm across feature dimension
-        similarity = torch.norm(diff_matrix, dim=2)  # [batch_size, batch_size]
-        too_similar = similarity < self.similarity_threshold
+        scaled_pred = pred / self.temperature
+        diff_matrix = scaled_pred.unsqueeze(0) - scaled_pred.unsqueeze(1)
+        too_similar = torch.abs(diff_matrix) < self.similarity_threshold
         too_similar.fill_diagonal_(False)
-
         similarity_counts = too_similar.float().sum(dim=1)
-        diversity_penalty = torch.exp(similarity_counts / pred.size(0)) - 1
+        diversity_penalty = torch.exp(similarity_counts / pred.shape[0]) - 1
         diversity_loss = diversity_penalty.mean()
-
-        # Adaptive diversity weight
+        # Could also use curriculum on the diversity weight
         current_weight = self.diversity_weight * (1 - torch.exp(-similarity_counts.mean()))
         total_loss = mse_loss + current_weight * diversity_loss
-
         return total_loss
 
 class CurriculumDataset(Dataset):
@@ -314,7 +299,9 @@ def train_curriculum():
                     outputs = model(images)
 
                     # Only compute loss for active coefficient
-                    loss = criterion(outputs[:, coeff_idx:coeff_idx+1], targets[:, coeff_idx:coeff_idx+1])
+                    pred = outputs[:, coeff_idx]
+                    targ = targets[:, coeff_idx]
+                    loss = criterion(pred, targ)
 
                     loss.backward()
                     clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -338,8 +325,9 @@ def train_curriculum():
                         targets = targets.to(device)
                         outputs = model(images)
 
-                        val_loss = criterion(outputs[:, coeff_idx:coeff_idx+1],
-                                             targets[:, coeff_idx:coeff_idx+1])
+                        pred = outputs[:, coeff_idx]
+                        targ = targets[:, coeff_idx]
+                        val_loss = criterion(pred, targ)
                         val_losses.append(val_loss.item())
 
                         val_predictions.append(outputs[:, coeff_idx].cpu())
