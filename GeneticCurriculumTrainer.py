@@ -326,26 +326,26 @@ class PhaseAwareLoss(nn.Module):
         # Clamp difference at 0.2 (maintain original saturation)
         saturated_diff = torch.clamp(diff, max=0.2)
 
-        # Apply edge correction only near boundaries where statistical effects matter
+        # Apply edge correction with smooth quadratic profile
+        # This avoids creating local minima in the expected loss
         edge_correction = torch.zeros_like(pred)
 
-        # Only apply corrections in the edge regions (within 0.2 of boundary)
-        edge_zone = 0.2  # Size of edge zone where correction is needed
+        # Calculate normalized distance from center
+        center_distance = torch.abs(pred)
 
-        # Calculate how far prediction is into the edge zone (0 at ±0.8, 1 at ±1.0)
-        left_edge_region = (pred <= -0.8) & (pred >= -1.0)
-        right_edge_region = (pred >= 0.8) & (pred <= 1.0)
+        # Apply smooth quadratic correction in edge regions
+        in_edge_region = (center_distance >= 0.8) & (center_distance <= 1.0)
 
-        # Calculate position in edge zone (0 to 1 scale)
-        left_position = (-pred[left_edge_region] - 0.8) / 0.2  # 0 at -0.8, 1 at -1.0
-        right_position = (pred[right_edge_region] - 0.8) / 0.2  # 0 at 0.8, 1 at 1.0
+        # Use quadratic function for smooth transition
+        # This creates a smooth bowl-shaped correction that exactly
+        # compensates for the edge disadvantage
+        edge_position = (center_distance[in_edge_region] - 0.8) / 0.2  # 0 to 1 scale
 
-        # Apply increasing correction as we approach the edge
-        # Maximum correction of 0.017 at the exact edge
-        edge_correction[left_edge_region] = left_position * 0.017
-        edge_correction[right_edge_region] = right_position * 0.017
+        # Quadratic profile: a*x² matches edge disadvantage of 0.00990 at x=1
+        correction_amount = -0.00990 * edge_position**2
+        edge_correction[in_edge_region] = correction_amount
 
-        # Add out-of-range penalty (keep as is)
+        # Add out-of-range penalty
         out_of_range = torch.clamp(torch.abs(pred) - 1.0, min=0)
         range_penalty = out_of_range ** 2
 
