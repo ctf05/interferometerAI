@@ -322,9 +322,35 @@ class PhaseAwareLoss(nn.Module):
     def saturated_loss(self, pred, target):
         # Calculate absolute difference
         diff = torch.abs(pred - target)
+
+        # Apply edge scaling to predictions near boundaries
+        edge_scaling = torch.ones_like(pred)
+
+        # Create scaling factors for edge regions [-1, -0.8] and [0.8, 1]
+        left_edge_mask = (pred < -0.8) & (pred >= -1.0)
+        right_edge_mask = (pred > 0.8) & (pred <= 1.0)
+
+        # Calculate how close we are to the edge (0 at -0.8/0.8, 1 at -1.0/1.0)
+        left_edge_factor = (-pred[left_edge_mask] - 0.8) / 0.2  # ranges from 0 to 1
+        right_edge_factor = (pred[right_edge_mask] - 0.8) / 0.2  # ranges from 0 to 1
+
+        # Scale by reducing error proportionally to edge proximity
+        # As we approach edge, we scale down the error to compensate for "missing space"
+        edge_scaling[left_edge_mask] = 1.0 - 0.5 * left_edge_factor
+        edge_scaling[right_edge_mask] = 1.0 - 0.5 * right_edge_factor
+
+        # Apply scaling to make edge predictions statistically fair
+        scaled_diff = diff * edge_scaling
+
         # Clamp at 0.2 - any error larger than 0.2 gets same penalty
-        saturated_diff = torch.clamp(diff, max=0.2)
-        return saturated_diff
+        saturated_diff = torch.clamp(scaled_diff, max=0.2)
+
+        # Add out-of-range penalty (keep as is)
+        out_of_range = torch.clamp(torch.abs(pred) - 1.0, min=0)
+        range_penalty = out_of_range ** 2
+
+        # Combine the losses (always non-negative)
+        return saturated_diff + range_penalty
 
     def forward(self, pred, target, is_training=False):
         # Ensure inputs are at least 2D (batch_size, num_coeffs)
