@@ -1,11 +1,9 @@
-import sys
 import os
 import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, random_split, Subset
+from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms
 from PIL import Image
 import numpy as np
@@ -14,6 +12,7 @@ from torch.nn.utils import clip_grad_norm_
 import matplotlib.pyplot as plt
 from datetime import datetime
 import math
+import copy
 
 # GPU setup
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -25,35 +24,88 @@ class SwishActivation(nn.Module):
 
 # Sinusoidal positional encoding
 class SinusoidalPositionalEncoding(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, channels=32):
         super().__init__()
         self.channels = channels
 
     def forward(self, x):
         batch, c, h, w = x.size()
-        y_pos = torch.linspace(-1, 1, h, device=x.device).view(1, 1, h, 1).repeat(batch, 1, 1, w)
-        x_pos = torch.linspace(-1, 1, w, device=x.device).view(1, 1, 1, w).repeat(batch, 1, h, 1)
 
-        # Add positional encodings as new channels
-        sin_x = torch.sin(math.pi * x_pos)
-        cos_x = torch.cos(math.pi * x_pos)
-        sin_y = torch.sin(math.pi * y_pos)
-        cos_y = torch.cos(math.pi * y_pos)
+        # Generate normalized coordinate grids
+        y_coords = torch.linspace(-1, 1, h, device=x.device).view(1, 1, h, 1).repeat(batch, 1, 1, w)
+        x_coords = torch.linspace(-1, 1, w, device=x.device).view(1, 1, 1, w).repeat(batch, 1, h, 1)
 
-        pos_encoding = torch.cat([sin_x, cos_x, sin_y, cos_y], dim=1)
+        # Compute radial distance from center (important for circular patterns)
+        r = torch.sqrt(x_coords**2 + y_coords**2)
+
+        # Calculate angular position (theta)
+        theta = torch.atan2(y_coords, x_coords)
+
+        # Create positional encodings
+        pos_enc = []
+
+        # Radial encodings at different frequencies
+        for freq in [1, 2, 4, 8]:
+            pos_enc.append(torch.sin(r * math.pi * freq))
+            pos_enc.append(torch.cos(r * math.pi * freq))
+
+        # Angular encodings at different frequencies
+        for freq in [1, 2, 4]:
+            pos_enc.append(torch.sin(theta * freq))
+            pos_enc.append(torch.cos(theta * freq))
+
+        # Cartesian encodings
+        pos_enc.append(torch.sin(x_coords * math.pi))
+        pos_enc.append(torch.cos(x_coords * math.pi))
+        pos_enc.append(torch.sin(y_coords * math.pi))
+        pos_enc.append(torch.cos(y_coords * math.pi))
+
+        # Concatenate all encodings
+        pos_encoding = torch.cat(pos_enc, dim=1)  # Should be 16 channels
+
+        # Concatenate with input
         return torch.cat([x, pos_encoding], dim=1)
 
+class FourierConvLayer(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        # Real and imaginary convolutions in frequency domain
+        self.conv_real = nn.Conv2d(in_channels, out_channels, 1)
+        self.conv_imag = nn.Conv2d(in_channels, out_channels, 1)
+        self.bn = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x):
+        # Apply 2D FFT
+        x_fft = torch.fft.rfft2(x)
+
+        # Get real and imaginary components
+        real, imag = x_fft.real, x_fft.imag
+
+        # Apply convolutions in frequency domain
+        real_out = self.conv_real(real) - self.conv_imag(imag)
+        imag_out = self.conv_real(imag) + self.conv_imag(real)
+
+        # Recombine and apply inverse FFT
+        x_fft_out = torch.complex(real_out, imag_out)
+        x_out = torch.fft.irfft2(x_fft_out, s=(x.shape[2], x.shape[3]))
+
+        return self.bn(x_out)
+
 class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1):
+    def __init__(self, in_channels, out_channels, stride=1, use_fourier=False):
         super(ResidualBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3,
                                stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(out_channels)
-        self.swish = SwishActivation()
+        self.leaky_relu = nn.LeakyReLU(0.2, inplace=True)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3,
                                stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
 
+        # Shortcut connection
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
@@ -62,78 +114,106 @@ class ResidualBlock(nn.Module):
                 nn.BatchNorm2d(out_channels)
             )
 
+        # Optional Fourier branch
+        self.use_fourier = use_fourier
+        if use_fourier:
+            self.fourier = FourierConvLayer(in_channels, out_channels)
+            self.fourier_weight = nn.Parameter(torch.tensor(0.2))
+
     def forward(self, x):
+        # Regular convolution path
         residual = x
-        out = self.swish(self.bn1(self.conv1(x)))
+        out = self.leaky_relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
+
+        # Add Fourier path if enabled
+        if self.use_fourier:
+            fourier_out = self.fourier(x)
+            out = out + self.fourier_weight * fourier_out
+
         out += self.shortcut(residual)
-        out = self.swish(out)
+        out = self.leaky_relu(out)
         return out
 
 class InterferogramNet(nn.Module):
     def __init__(self):
         super(InterferogramNet, self).__init__()
-        # Initial convolution
+
+        # 1. Initial convolution with coordinate-aware features
         self.initial = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
-            SwishActivation()
+            nn.LeakyReLU(0.2, inplace=True)
         )
-
-        # Add positional encoding
         self.positional_encoding = SinusoidalPositionalEncoding(32)
-        self.post_position = nn.Sequential(
-            nn.Conv2d(36, 32, kernel_size=1),
+
+        # Combine and adjust channels after positional encoding
+        # Input becomes 32 + 16 = 48 channels
+        self.post_positional = nn.Sequential(
+            nn.Conv2d(50, 32, kernel_size=1),
             nn.BatchNorm2d(32),
-            SwishActivation()
+            nn.LeakyReLU(0.2, inplace=True)
         )
 
-        # Residual blocks
+        # 2. Residual blocks with Fourier processing
+        # First layer doesn't use Fourier to save computation
         self.layer1 = nn.Sequential(
-            ResidualBlock(32, 64, stride=2),
-            ResidualBlock(64, 64)
+            ResidualBlock(32, 64, stride=2, use_fourier=False),
+            ResidualBlock(64, 64, use_fourier=True)
         )
+        # Middle and later layers use Fourier processing
         self.layer2 = nn.Sequential(
-            ResidualBlock(64, 128, stride=2),
-            ResidualBlock(128, 128)
+            ResidualBlock(64, 128, stride=2, use_fourier=True),
+            ResidualBlock(128, 128, use_fourier=True)
         )
         self.layer3 = nn.Sequential(
-            ResidualBlock(128, 256, stride=2),
-            ResidualBlock(256, 256)
+            ResidualBlock(128, 256, stride=2, use_fourier=True),
+            ResidualBlock(256, 256, use_fourier=True)
         )
 
-        # Global pooling with both max and average
-        self.global_pool_max = nn.AdaptiveMaxPool2d(1)
+        # Global pooling (both max and average for better feature representation)
         self.global_pool_avg = nn.AdaptiveAvgPool2d(1)
+        self.global_pool_max = nn.AdaptiveMaxPool2d(1)
 
-        # Separate prediction pathways
-        # Tilt parameters (B, C)
-        self.tilt_predictor = nn.Sequential(
-            nn.Linear(256 * 2, 128),
-            SwishActivation(),
+        # 3. Separate predictors for different coefficient types
+        # Low-order coefficients (Defocus: D)
+        self.defocus_predictor = nn.Sequential(
+            nn.Linear(512, 128),  # 512 = 256*2 (from avg+max pooling)
+            nn.LeakyReLU(0.2),
             nn.Dropout(0.3),
             nn.Linear(128, 64),
-            SwishActivation(),
-            nn.Linear(64, 2)
+            nn.LeakyReLU(0.2),
+            nn.Linear(64, 1)  # Predict D coefficient
         )
 
-        # Defocus parameter (D)
-        self.defocus_predictor = nn.Sequential(
-            nn.Linear(256 * 2, 64),
-            SwishActivation(),
+        # Tilt coefficients (B, C)
+        self.tilt_predictor = nn.Sequential(
+            nn.Linear(512, 128),
+            nn.LeakyReLU(0.2),
             nn.Dropout(0.2),
-            nn.Linear(64, 1)
+            nn.Linear(128, 64),
+            nn.LeakyReLU(0.2),
+            nn.Linear(64, 2)  # Predict B, C coefficients
         )
 
-        # Higher order parameters (G, F, J, E, I)
+        # Astigmatism coefficients (E, I)
+        self.astigmatism_predictor = nn.Sequential(
+            nn.Linear(512, 128),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.LeakyReLU(0.2),
+            nn.Linear(64, 2)  # Predict E, I coefficients
+        )
+
+        # Higher-order coefficients (G, F, J)
         self.higher_order_predictor = nn.Sequential(
-            nn.Linear(256 * 2, 256),
-            SwishActivation(),
+            nn.Linear(512, 128),
+            nn.LeakyReLU(0.2),
             nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            SwishActivation(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 5)
+            nn.Linear(128, 64),
+            nn.LeakyReLU(0.2),
+            nn.Linear(64, 3)  # Predict G, F, J coefficients
         )
 
         self.apply(self._init_weights)
@@ -141,32 +221,40 @@ class InterferogramNet(nn.Module):
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            nn.init.xavier_uniform_(m.weight, gain=1.6)  # Increased gain
+            nn.init.xavier_uniform_(m.weight, gain=1.4)
             if m.bias is not None:
-                nn.init.uniform_(m.bias, -0.2, 0.2)  # Wider init
+                # Use non-zero bias initialization to help break symmetry
+                nn.init.uniform_(m.bias, -0.1, 0.1)
+
         elif isinstance(m, nn.Conv2d):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu', a=0.2)
+
         elif isinstance(m, nn.BatchNorm2d):
             nn.init.constant_(m.weight, 1)
             nn.init.constant_(m.bias, 0)
 
-        # Special initialization for final layers to prevent zero predictions
-        if isinstance(m, nn.Linear) and m.out_features <= 8:
-            nn.init.normal_(m.weight, 0, 0.02)
-            if m.bias is not None:
-                nn.init.uniform_(m.bias, -0.3, 0.3)
+        # Special initialization for the final layer of each predictor
+        # This helps prevent the "all zeros" prediction problem
+        if isinstance(m, nn.Linear) and hasattr(m, 'out_features'):
+            if m.out_features <= 3:  # Final layer of any predictor
+                nn.init.normal_(m.weight, 0, 0.02)
+                if m.bias is not None:
+                    nn.init.uniform_(m.bias, -0.2, 0.2)
 
     def forward(self, x):
         if self.forward_count < 5:
             print(f"\nForward pass {self.forward_count}")
             print(f"Input shape: {x.shape}")
             print(f"Input range: [{x.min():.3f}, {x.max():.3f}]")
-            print(f"VRAM usage: {torch.cuda.memory_allocated() / 1024**2:.1f}MB / {torch.cuda.memory_reserved() / 1024**2:.1f}MB")
+            if torch.cuda.is_available():
+                print(f"VRAM usage: {torch.cuda.memory_allocated() / 1024**2:.1f}MB / {torch.cuda.memory_reserved() / 1024**2:.1f}MB")
 
         # Initial processing with positional encoding
         x = self.initial(x)
-        x = self.positional_encoding(x)
-        x = self.post_position(x)
+        x = self.positional_encoding(x)  # Adds coordinate-aware features
+        x = self.post_positional(x)
+
+        # Feature extraction through residual blocks with Fourier processing
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
@@ -174,34 +262,35 @@ class InterferogramNet(nn.Module):
         if self.forward_count < 5:
             print(f"After features shape: {x.shape}")
             print(f"After features range: [{x.min():.3f}, {x.max():.3f}]")
-            print(f"VRAM usage: {torch.cuda.memory_allocated() / 1024**2:.1f}MB / {torch.cuda.memory_reserved() / 1024**2:.1f}MB")
+            if torch.cuda.is_available():
+                print(f"VRAM usage: {torch.cuda.memory_allocated() / 1024**2:.1f}MB / {torch.cuda.memory_reserved() / 1024**2:.1f}MB")
 
-        # Global pooling (both max and average)
-        x_max = self.global_pool_max(x)
-        x_avg = self.global_pool_avg(x)
-        pooled = torch.cat([x_max, x_avg], dim=1).view(x.size(0), -1)
+        # Global pooling (both average and max for better features)
+        x_avg = self.global_pool_avg(x).view(x.size(0), -1)
+        x_max = self.global_pool_max(x).view(x.size(0), -1)
+        x_pooled = torch.cat([x_avg, x_max], dim=1)
 
-        # Separate predictions for different coefficient types
-        tilt = self.tilt_predictor(pooled)                # B, C (indices 2, 1)
-        defocus = self.defocus_predictor(pooled)          # D (index 0)
-        higher_order = self.higher_order_predictor(pooled) # G, F, J, E, I (indices 3, 4, 5, 6, 7)
+        # Separate predictions through specialized pathways
+        defocus_out = self.defocus_predictor(x_pooled)            # D (index 0)
+        tilt_out = self.tilt_predictor(x_pooled)                  # B, C (indices 2, 1)
+        astigmatism_out = self.astigmatism_predictor(x_pooled)    # E, I (indices 6, 7)
+        higher_out = self.higher_order_predictor(x_pooled)        # G, F, J (indices 3, 4, 5)
 
-        # Reorder to match expected output [D, C, B, G, F, J, E, I]
+        # Reorder outputs to match expected [D, C, B, G, F, J, E, I] format
         outputs = torch.cat([
-            defocus,                # D (0)
-            tilt[:, 1:2],           # C (1)
-            tilt[:, 0:1],           # B (2)
-            higher_order[:, 0:1],   # G (3)
-            higher_order[:, 1:2],   # F (4)
-            higher_order[:, 2:3],   # J (5)
-            higher_order[:, 3:4],   # E (6)
-            higher_order[:, 4:5],   # I (7)
+            defocus_out,                  # D (0)
+            tilt_out[:, 1:2],             # C (1)
+            tilt_out[:, 0:1],             # B (2)
+            higher_out[:, 0:1],           # G (3)
+            higher_out[:, 1:2],           # F (4)
+            higher_out[:, 2:3],           # J (5)
+            astigmatism_out[:, 0:1],      # E (6)
+            astigmatism_out[:, 1:2],      # I (7)
         ], dim=1)
 
         if self.forward_count < 5:
             print(f"Output shape: {outputs.shape}")
             print(f"Output range: [{outputs.min():.3f}, {outputs.max():.3f}]")
-            print(f"Output mean: {outputs.mean():.3f}, std: {outputs.std():.3f}")
             print(f"VRAM usage: {torch.cuda.memory_allocated() / 1024**2:.1f}MB / {torch.cuda.memory_reserved() / 1024**2:.1f}MB")
 
         self.forward_count += 1
@@ -462,7 +551,146 @@ def get_cyclic_lr(epoch, batch_idx, batches_per_epoch, base_lr=1e-4, max_lr=1e-3
         # Decreasing phase
         return max_lr - (max_lr - base_lr) * (2 * (cycle_position - 0.5))
 
-# Modify the training loop to use cyclic learning rates
+def train_with_genetic_exploration(model, train_loader, criterion, population_size=5, batch_samples=5, device=device):
+    """
+    Implement genetic-style exploration to help escape local minima.
+    Returns the best performing model from the population.
+    """
+    print(f"\nRunning genetic exploration with population size {population_size}")
+
+    # Create a population of models with variations
+    population = [copy.deepcopy(model) for _ in range(population_size)]
+
+    # Add parameter noise to each model (except the first one which stays as-is)
+    for i in range(1, population_size):
+        noise_scale = 0.02 * (i / (population_size - 1) + 0.5)  # Increasing noise levels
+        for param in population[i].parameters():
+            noise = torch.randn_like(param) * noise_scale
+            param.data += noise
+        print(f"Added {noise_scale:.3f} scale noise to model variant {i}")
+
+    # Train each model for a few batches and track fitness
+    fitness_scores = []
+    val_predictions = []
+
+    for model_idx, model_variant in enumerate(population):
+        model_variant.to(device)
+        model_variant.train()
+        optimizer = optim.AdamW(model_variant.parameters(), lr=1e-4)
+
+        losses = []
+        all_preds = []
+
+        # Train on a few batches
+        for batch_idx, (images, targets) in enumerate(train_loader):
+            if batch_idx >= batch_samples:
+                break
+
+            images = images.to(device)
+            targets = targets.to(device)
+
+            optimizer.zero_grad()
+            outputs = model_variant(images)
+
+            loss = criterion(outputs, targets)
+            loss.backward()
+            clip_grad_norm_(model_variant.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            losses.append(loss.item())
+            all_preds.append(outputs.detach().cpu())
+
+        # Calculate fitness score based on:
+        # 1. Loss value (lower is better)
+        # 2. Prediction spread (higher std is better)
+        avg_loss = np.mean(losses)
+        all_preds = torch.cat(all_preds)
+        pred_std = all_preds.std().item()
+
+        # Combined fitness score: negative loss (higher is better) plus spread bonus
+        fitness = -avg_loss + 0.2 * pred_std
+        fitness_scores.append(fitness)
+        val_predictions.append(all_preds)
+
+        print(f"Model {model_idx}: Loss={avg_loss:.4f}, Std={pred_std:.4f}, Fitness={fitness:.4f}")
+
+    # Select best model
+    best_idx = np.argmax(fitness_scores)
+    best_model = population[best_idx]
+    best_fitness = fitness_scores[best_idx]
+
+    # Plot predictions distributions from different population members
+    plt.figure(figsize=(12, 8))
+    for i, preds in enumerate(val_predictions):
+        plt.subplot(3, 2, i+1)
+        plt.hist(preds.numpy().flatten(), bins=30)
+        plt.title(f"Model {i}: Fitness={fitness_scores[i]:.4f}")
+    plt.tight_layout()
+    plt.savefig(f"genetic_exploration_distributions_{int(time.time())}.png")
+    plt.close()
+
+    # Optional: Perform crossover between top models
+    if population_size >= 3:
+        # Sort indices by fitness
+        sorted_indices = np.argsort(fitness_scores)[::-1]
+        parent1_idx = sorted_indices[0]
+        parent2_idx = sorted_indices[1]
+
+        # Create child through crossover of top two models
+        child_model = copy.deepcopy(population[parent1_idx])
+        parent2 = population[parent2_idx]
+
+        # Simple crossover: randomly select parameters from either parent
+        with torch.no_grad():
+            for child_param, parent2_param in zip(child_model.parameters(), parent2.parameters()):
+                # Randomly choose whether to use parent1 (keep as is) or parent2 param
+                mask = torch.rand_like(child_param) > 0.5
+                child_param.data[mask] = parent2_param.data[mask]
+
+        # Evaluate the child
+        child_model.to(device)
+        child_model.train()
+        child_optimizer = optim.AdamW(child_model.parameters(), lr=1e-4)
+
+        child_losses = []
+        child_preds = []
+
+        for batch_idx, (images, targets) in enumerate(train_loader):
+            if batch_idx >= batch_samples:
+                break
+
+            images = images.to(device)
+            targets = targets.to(device)
+
+            child_optimizer.zero_grad()
+            outputs = child_model(images)
+
+            loss = criterion(outputs, targets)
+            loss.backward()
+            clip_grad_norm_(child_model.parameters(), max_norm=1.0)
+            child_optimizer.step()
+
+            child_losses.append(loss.item())
+            child_preds.append(outputs.detach().cpu())
+
+        # Evaluate child fitness
+        avg_child_loss = np.mean(child_losses)
+        all_child_preds = torch.cat(child_preds)
+        child_pred_std = all_child_preds.std().item()
+        child_fitness = -avg_child_loss + 0.2 * child_pred_std
+
+        print(f"Child model: Loss={avg_child_loss:.4f}, Std={child_pred_std:.4f}, Fitness={child_fitness:.4f}")
+
+        # Use child if it's better than the best parent
+        if child_fitness > best_fitness:
+            best_model = child_model
+            best_fitness = child_fitness
+            print("Child model outperforms best parent and will be used!")
+
+    # Return the best model
+    best_model.to(device)
+    return best_model
+
 def train_curriculum():
     print(f"Starting curriculum training on {device}")
     start_time = time.time()
@@ -473,10 +701,14 @@ def train_curriculum():
     os.makedirs(log_dir, exist_ok=True)
 
     # Training settings
-    target_loss = 0.02  # Adjusted target loss to be more realistic
-    patience_limit = 100  # How many epochs to wait for improvement
-    max_epochs_per_phase = 1000
+    target_loss = 0.015  # Adjusted target loss to be more realistic
+    patience_limit = 50  # How many epochs to wait for improvement
+    max_epochs_per_phase = 100
     param_names = ['D', 'C', 'B', 'G', 'F', 'J', 'E', 'I']
+
+    # Genetic exploration settings
+    genetic_exploration_frequency = 10  # Run genetic exploration every N epochs
+    population_size = 5
 
     # Initialize model
     model = InterferogramNet().to(device)
@@ -496,13 +728,14 @@ def train_curriculum():
     batches_per_epoch = len(train_loader)
 
     # Use cyclic learning rates instead of fixed
-    base_lr, max_lr = 5e-5, 5e-3
+    base_lr, max_lr = 5e-5, 1e-3
     optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-4, eps=1e-6)
 
     for epoch in range(warm_up_epochs):
         criterion.update_epoch(epoch)
         model.train()
         train_losses = []
+        lr_values = []
 
         # Add more noise in early epochs
         noise_level = 0.1 * (1 - epoch/warm_up_epochs)
@@ -512,6 +745,8 @@ def train_curriculum():
             current_lr = get_cyclic_lr(epoch, batch_idx, batches_per_epoch, base_lr, max_lr)
             for param_group in optimizer.param_groups:
                 param_group['lr'] = current_lr
+
+            lr_values.append(current_lr)
 
             images = images.to(device)
             targets = targets.to(device)
@@ -564,12 +799,33 @@ def train_curriculum():
         train_loss = np.mean(train_losses)
         val_loss = np.mean(val_losses)
         val_predictions = torch.cat(val_predictions)
+        avg_lr = np.mean(lr_values)
 
         print(f"\nWarm-up Epoch {epoch} Summary:")
         print(f"Training Loss: {train_loss:.6f}")
         print(f"Validation Loss: {val_loss:.6f}")
+        print(f"Average LR: {avg_lr:.6f}")
         print(f"Prediction Stats - mean: {val_predictions.mean():.3f}, std: {val_predictions.std():.3f}")
         print(f"Prediction Range: [{val_predictions.min():.3f}, {val_predictions.max():.3f}]")
+
+        # Plot warm-up distribution and learning rate
+        plt.figure(figsize=(12, 5))
+
+        # Distribution plot
+        plt.subplot(1, 2, 1)
+        plt.hist(val_predictions.numpy(), bins=30, alpha=0.7)
+        plt.title(f'D Coefficient Distribution - Warm-up Epoch {epoch}')
+
+        # Learning rate plot
+        plt.subplot(1, 2, 2)
+        plt.plot(lr_values)
+        plt.title('Learning Rate Cycle')
+        plt.xlabel('Batch')
+        plt.ylabel('Learning Rate')
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(log_dir, f'warmup_epoch_{epoch}.png'))
+        plt.close()
 
     # Save warm-up model
     torch.save({
@@ -579,7 +835,7 @@ def train_curriculum():
 
     print(f"\nWarm-up completed. Proceeding with curriculum training.")
 
-    # Training phases with cyclic learning rates
+    # Training phases with genetic exploration and cyclic learning rates
     # First, train each coefficient individually with increasing bounds
     for bound in np.arange(0, 5, 0.5):
         print(f"\n=== Starting training phase with bound {bound:.1f} ===")
@@ -592,7 +848,7 @@ def train_curriculum():
             train_loader, val_loader = create_curriculum_loader(folder_name, [coeff_idx])
             batches_per_epoch = len(train_loader)
 
-            # Initialize optimizer with base learning rate
+            # Initialize optimizer with base learning rate for cycling
             base_lr, max_lr = 1e-5, 5e-4  # Slightly lower for main training
             optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-4)
 
@@ -601,10 +857,26 @@ def train_curriculum():
 
             # Training loop for current phase
             for epoch in range(max_epochs_per_phase):
+                # Update epoch in criterion
                 criterion.update_epoch(epoch)
+
+                # Check if we should run genetic exploration this epoch
+                if epoch > 0 and epoch % genetic_exploration_frequency == 0:
+                    print(f"\n=== Running genetic exploration at epoch {epoch} ===")
+                    model = train_with_genetic_exploration(
+                        model,
+                        train_loader,
+                        lambda outputs, targets: criterion(outputs[:, coeff_idx].unsqueeze(1),
+                                                           targets[:, coeff_idx].unsqueeze(1)),
+                        population_size=population_size,
+                        batch_samples=10
+                    )
+                    # Update optimizer to use the new model parameters
+                    optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-4)
+
                 model.train()
                 train_losses = []
-                lr_values = []  # Track learning rates
+                lr_values = []
 
                 # Training phase
                 for batch_idx, (images, targets) in enumerate(train_loader):
@@ -667,22 +939,22 @@ def train_curriculum():
                 print(f"\nEpoch {epoch} Summary:")
                 print(f"Training Loss: {train_loss:.6f}")
                 print(f"Validation Loss: {val_loss:.6f}")
-                print(f"Avg Learning Rate: {avg_lr:.6f}")
+                print(f"Average LR: {avg_lr:.6f}")
                 print(f"Predictions range: [{val_predictions.min():.3f}, {val_predictions.max():.3f}]")
                 print(f"Targets range: [{val_targets.min():.3f}, {val_targets.max():.3f}]")
                 print(f"Patience: {patience_counter}")
 
-                # Plot prediction distribution
-                plt.figure(figsize=(12, 6))
+                # Plot prediction distribution and learning rate
+                plt.figure(figsize=(12, 5))
 
-                # Main histogram
+                # Distribution plot
                 plt.subplot(1, 2, 1)
                 plt.hist(val_predictions.numpy(), bins=50, alpha=0.5, label='Predictions')
                 plt.hist(val_targets.numpy(), bins=50, alpha=0.5, label='Targets')
                 plt.title(f'Distribution for {param_names[coeff_idx]} - Epoch {epoch}')
                 plt.legend()
 
-                # Plot learning rate cycle
+                # Learning rate plot
                 plt.subplot(1, 2, 2)
                 plt.plot(lr_values)
                 plt.title('Learning Rate Cycle')
@@ -723,7 +995,7 @@ def train_curriculum():
                     break
 
     # Final phase: TrainingEverything with progressive coefficient activation
-    # This phase also uses cyclic learning rates
+    # Also using cyclic learning rates and genetic exploration
     print("\n=== Starting final phase with TrainingEverything ===")
 
     for num_active_coeffs in range(1, 9):
@@ -741,6 +1013,20 @@ def train_curriculum():
 
         for epoch in range(max_epochs_per_phase):
             criterion.update_epoch(epoch)
+
+            # Check if we should run genetic exploration this epoch
+            if epoch > 0 and epoch % genetic_exploration_frequency == 0:
+                print(f"\n=== Running genetic exploration at epoch {epoch} ===")
+                model = train_with_genetic_exploration(
+                    model,
+                    train_loader,
+                    lambda outputs, targets: criterion(outputs[:, active_coeffs], targets[:, active_coeffs]),
+                    population_size=population_size,
+                    batch_samples=10
+                )
+                # Update optimizer after genetic exploration
+                optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-4)
+
             model.train()
             train_losses = []
             lr_values = []
@@ -793,6 +1079,7 @@ def train_curriculum():
 
             train_loss = np.mean(train_losses)
             val_loss = np.mean(val_losses)
+            avg_lr = np.mean(lr_values)
 
             # Analyze predictions
             val_predictions = torch.cat(val_predictions)
@@ -801,15 +1088,26 @@ def train_curriculum():
             print(f"\nEpoch {epoch} Summary:")
             print(f"Training Loss: {train_loss:.6f}")
             print(f"Validation Loss: {val_loss:.6f}")
+            print(f"Average LR: {avg_lr:.6f}")
 
-            # Plot prediction distributions for each active coefficient
-            plt.figure(figsize=(15, 5 * ((num_active_coeffs + 1) // 2)))
+            # Plot prediction distributions and learning rate
+            plt.figure(figsize=(15, 5 * ((num_active_coeffs + 1) // 2) + 5))
+
+            # Coefficient distributions
             for i, coeff_idx in enumerate(active_coeffs):
-                plt.subplot(((num_active_coeffs + 1) // 2), 2, i + 1)
+                plt.subplot(((num_active_coeffs + 1) // 2) + 1, 2, i + 1)
                 plt.hist(val_predictions[:, i].numpy(), bins=50, alpha=0.5, label='Predictions')
                 plt.hist(val_targets[:, i].numpy(), bins=50, alpha=0.5, label='Targets')
                 plt.title(f'Distribution for {param_names[coeff_idx]}')
                 plt.legend()
+
+            # Learning rate plot (in the last position)
+            plt.subplot(((num_active_coeffs + 1) // 2) + 1, 2, num_active_coeffs + 1)
+            plt.plot(lr_values)
+            plt.title('Learning Rate Cycle')
+            plt.xlabel('Batch')
+            plt.ylabel('Learning Rate')
+
             plt.tight_layout()
             plt.savefig(os.path.join(log_dir, f'final_phase_epoch_{epoch}.png'))
             plt.close()
