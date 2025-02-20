@@ -303,7 +303,7 @@ class InterferogramNet(nn.Module):
         return outputs
 
 class PhaseAwareLoss(nn.Module):
-    def __init__(self, similarity_threshold=0.1, diversity_weight=0.1, temperature=1.0, spread_factor=0.3):
+    def __init__(self, similarity_threshold=0.1, diversity_weight=0.1, temperature=1.0, spread_factor=0.3, warm_up_epochs=5):
         super().__init__()
         self.mse = nn.MSELoss(reduction='none')
         self.similarity_threshold = similarity_threshold
@@ -311,6 +311,7 @@ class PhaseAwareLoss(nn.Module):
         self.temperature = temperature
         self.spread_factor = spread_factor
         self.epoch = 0
+        self.warm_up_epochs = warm_up_epochs
 
         # Weight coefficients based on their impact on interferograms
         self.coeff_weights = nn.Parameter(
@@ -318,7 +319,14 @@ class PhaseAwareLoss(nn.Module):
             requires_grad=False
         )
 
-    def forward(self, pred, target):
+    def saturated_loss(self, pred, target):
+        # Calculate absolute difference
+        diff = torch.abs(pred - target)
+        # Clamp at 0.2 - any error larger than 0.2 gets same penalty
+        saturated_diff = torch.clamp(diff, max=0.2)
+        return saturated_diff
+
+    def forward(self, pred, target, is_training=False):
         # Ensure inputs are at least 2D (batch_size, num_coeffs)
         if pred.dim() == 1:
             pred = pred.unsqueeze(1)
@@ -338,9 +346,9 @@ class PhaseAwareLoss(nn.Module):
             # This assumes that the coefficients are ordered consistently
             coeff_weights = self.coeff_weights[:num_coeffs].to(pred.device)
 
-        # Main MSE loss with coefficient weighting
-        mse_loss = self.mse(pred, target)
-        weighted_mse = (mse_loss * coeff_weights).mean()
+        # Main loss with coefficient weighting
+        base_loss = self.saturated_loss(pred, target)
+        weighted_base_loss = (base_loss * coeff_weights).mean()
 
         # Identify predictions that are within threshold of target
         close_to_target = torch.abs(pred - target) < 0.2
@@ -410,12 +418,12 @@ class PhaseAwareLoss(nn.Module):
         spread_weight = self.spread_factor * epoch_factor
 
         # Combine all loss components
-        total_loss = weighted_mse + (current_weight * diversity_loss) + (spread_weight * spread_loss)
+        total_loss = weighted_base_loss + (current_weight * diversity_loss) + (spread_weight * spread_loss)
 
         # Debug prints
         if torch.rand(1).item() < 0.01:  # Print for ~1% of batches
             print(f"\nLoss Components (Epoch {self.epoch}):")
-            print(f"Weighted MSE Loss: {weighted_mse:.6f}")
+            print(f"Weighted Base Loss: {weighted_base_loss:.6f}")
             print(f"Diversity Loss: {diversity_loss:.6f} (weight: {current_weight:.3f})")
             print(f"Spread Loss: {spread_loss:.6f} (weight: {spread_weight:.3f})")
             print(f"Prediction std: {pred_std:.4f}")
@@ -429,6 +437,22 @@ class PhaseAwareLoss(nn.Module):
                     coeff_vals = pred[:, i]
                     print(f"  Coeff {i}: mean={coeff_vals.mean():.3f}, std={coeff_vals.std():.3f}")
                     print(f"     range: [{coeff_vals.min():.3f}, {coeff_vals.max():.3f}]")
+
+        if self.epoch < self.warm_up_epochs and is_training:
+            min_prediction_magnitude = 0.8 * (1 - self.epoch / self.warm_up_epochs)
+            # Lower bound penalty (force away from zero)
+            outside_zero_penalty = torch.clamp(min_prediction_magnitude - torch.abs(pred), min=0)
+            # Upper bound penalty (force within [-1,1])
+            outside_range_penalty = torch.clamp(torch.abs(pred) - 1.0, min=0)
+
+            # Range coverage penalty - check if we're using both positive and negative values
+            max_vals = torch.max(pred, dim=0)[0]
+            min_vals = torch.min(pred, dim=0)[0]
+            range_coverage_penalty = torch.clamp(0.5 - max_vals, min=0) + torch.clamp(min_vals + 0.5, min=0)
+
+            # Combine all penalties
+            zero_constraint_loss = 10 * (outside_zero_penalty + outside_range_penalty) + 5 * range_coverage_penalty
+            total_loss = zero_constraint_loss.mean() * 100
 
         return total_loss
 
@@ -730,7 +754,7 @@ def train_curriculum():
     warm_up_epochs = 5
 
     # Get data loader for warm-up (use everything folder but just one coefficient)
-    train_loader, val_loader = create_curriculum_loader('TrainingEverything', [0])
+    train_loader, val_loader = create_curriculum_loader('TrainingD0_0', [0])
     batches_per_epoch = len(train_loader)
 
     # Use cyclic learning rates instead of fixed
@@ -773,7 +797,7 @@ def train_curriculum():
             # Only compute loss for first coefficient during warm-up
             pred = outputs[:, 0]
             targ = targets[:, 0]
-            loss = criterion(pred.unsqueeze(1), targ.unsqueeze(1))
+            loss = criterion(pred.unsqueeze(1), targ.unsqueeze(1), is_training=True)
 
             loss.backward()
             clip_grad_norm_(model.parameters(), max_norm=1.0)
