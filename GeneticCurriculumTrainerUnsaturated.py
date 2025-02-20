@@ -319,40 +319,21 @@ class PhaseAwareLoss(nn.Module):
             requires_grad=False
         )
 
-    def saturated_loss(self, pred, target):
-        # Calculate absolute difference
-        diff = torch.abs(pred - target)
+    def flat_expected_loss(self, pred, target):
+        # Absolute error component
+        abs_error = torch.abs(pred - target)
 
-        # Clamp difference at 0.2 (maintain original saturation)
-        saturated_diff = torch.clamp(diff, max=0.2)
+        # Correction term to ensure constant expected loss
+        correction_term = 0.5 * (1 - pred**2)
 
-        # Apply edge correction with smooth quadratic profile
-        # This avoids creating local minima in the expected loss
-        edge_correction = torch.zeros_like(pred)
-
-        # Calculate normalized distance from center
-        center_distance = torch.abs(pred)
-
-        # Apply smooth quadratic correction in edge regions
-        in_edge_region = (center_distance >= 0.8) & (center_distance <= 1.0)
-
-        # Use quadratic function for smooth transition
-        # This creates a smooth bowl-shaped correction that exactly
-        # compensates for the edge disadvantage
-        edge_position = (center_distance[in_edge_region] - 0.8) / 0.2  # 0 to 1 scale
-
-        # Quadratic profile: a*x² matches edge disadvantage of 0.00990 at x=1
-        correction_amount = -0.00990 * edge_position**2
-        edge_correction[in_edge_region] = correction_amount
-
-        # Add out-of-range penalty
-        out_of_range = torch.clamp(torch.abs(pred) - 1.0, min=0)
-        range_penalty = out_of_range ** 2
+        # Penalize predictions outside [-1, 1] range
+        outside_range = torch.clamp(torch.abs(pred) - 1.0, min=0)
+        out_of_bounds_penalty = outside_range**2 * 10  # Quadratic penalty with higher weight
 
         # Combine all components
-        balanced_loss = saturated_diff + edge_correction + range_penalty
+        total_loss = abs_error + correction_term + out_of_bounds_penalty
 
-        return balanced_loss
+        return total_loss
 
     def forward(self, pred, target, is_training=False, warm_up_epochs=5):
         self.warm_up_epochs = warm_up_epochs
@@ -376,7 +357,7 @@ class PhaseAwareLoss(nn.Module):
             coeff_weights = self.coeff_weights[:num_coeffs].to(pred.device)
 
         # Main loss with coefficient weighting
-        base_loss = self.saturated_loss(pred, target)
+        base_loss = self.flat_expected_loss(pred, target)
         weighted_base_loss = (base_loss * coeff_weights).mean()
 
         # Identify predictions that are within threshold of target
@@ -780,7 +761,7 @@ def train_curriculum():
 
     # Add warm-up phase to help break symmetry
     print("\n=== Starting warm-up phase ===")
-    warm_up_epochs = 5
+    warm_up_epochs = 1
 
     # Get data loader for warm-up (use everything folder but just one coefficient)
     train_loader, val_loader = create_curriculum_loader('TrainingD0_0', [0])
